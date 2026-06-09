@@ -1,0 +1,58 @@
+{
+  "os": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "python": "CPython 3.14.3",
+  "startedAt": "2026-06-08T12:56:20.127185Z",
+  "args": [
+    "--data",
+    "data/clean_combined.jsonl",
+    "--tok",
+    "tokenizer/tokenizer.model",
+    "--init_from",
+    "checkpoints/pretrain/best.pt",
+    "--ckpt_dir",
+    "checkpoints/finetune/",
+    "--lr",
+    "1e-4",
+    "--warmup",
+    "500",
+    "--label_smoothing",
+    "0.05",
+    "--patience",
+    "5",
+    "--wandb_project",
+    "lexiform",
+    "--wandb_run",
+    "stage2-finetune"
+  ],
+  "program": "-m training.train",
+  "git": {
+    "remote": "https://github.com/Raj-pro/LexiForm.git",
+    "commit": "3434c26192e89aff270da672cf54c49b07c37aee"
+  },
+  "email": "rajnayan2512@gmail.com",
+  "root": "/Users/raj/Documents/project/llm",
+  "host": "MacBook-Air-2.local",
+  "executable": "/Users/raj/Documents/project/llm/.venv/bin/python3",
+  "cpu_count": 10,
+  "cpu_count_logical": 10,
+  "disk": {
+    "/": {
+      "total": "245107195904",
+      "used": "207371702272"
+    }
+  },
+  "memory": {
+    "total": "17179869184"
+  },
+  "apple": {
+    "name": "Apple M4",
+    "ecpuCores": 6,
+    "pcpuCores": 4,
+    "gpuCores": 8,
+    "memoryGb": 16,
+    "swapTotalBytes": "6442450944",
+    "ramTotalBytes": "17179869184",
+    "macModel": "Mac16,12"
+  },
+  "writerId": "35b4ebejkuwhnakicsifnqzqpk0v1380"
+}

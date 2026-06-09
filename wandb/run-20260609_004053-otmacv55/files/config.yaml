@@ -1,0 +1,102 @@
+_wandb:
+    value:
+        cli_version: 0.27.2
+        e:
+            tacoy5f7wzd8swm8h7ajjizcp4w99y4s:
+                apple:
+                    ecpuCores: 6
+                    gpuCores: 8
+                    macModel: Mac16,12
+                    memoryGb: 16
+                    name: Apple M4
+                    pcpuCores: 4
+                    ramTotalBytes: "17179869184"
+                args:
+                    - --data
+                    - data/clean_combined.jsonl
+                    - --tok
+                    - tokenizer/tokenizer.model
+                    - --init_from
+                    - checkpoints/pretrain/best.pt
+                    - --ckpt_dir
+                    - checkpoints/finetune/
+                    - --lr
+                    - "1e-4"
+                    - --warmup
+                    - "500"
+                    - --label_smoothing
+                    - "0.05"
+                    - --patience
+                    - "5"
+                    - --wandb_project
+                    - lexiform
+                    - --wandb_run
+                    - stage2-finetune
+                cpu_count: 10
+                cpu_count_logical: 10
+                disk:
+                    /:
+                        total: "245107195904"
+                        used: "201548099584"
+                email: rajnayan2512@gmail.com
+                executable: /Users/raj/Documents/project/llm/.venv/bin/python3
+                git:
+                    commit: 3434c26192e89aff270da672cf54c49b07c37aee
+                    remote: https://github.com/Raj-pro/LexiForm.git
+                host: MacBook-Air-2.local
+                memory:
+                    total: "17179869184"
+                os: macOS-26.3.1-arm64-arm-64bit-Mach-O
+                program: -m training.train
+                python: CPython 3.14.3
+                root: /Users/raj/Documents/project/llm
+                startedAt: "2026-06-08T19:10:53.572341Z"
+                writerId: tacoy5f7wzd8swm8h7ajjizcp4w99y4s
+        m: []
+        python_version: 3.14.3
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 2
+                - 13
+                - 16
+                - 62
+            "4": 3.14.3
+            "5": 0.27.2
+            "12": 0.27.2
+            "13": darwin-arm64
+batch_size:
+    value: 64
+ckpt_dir:
+    value: checkpoints/finetune/
+data:
+    value: data/clean_combined.jsonl
+ema_decay:
+    value: 0.999
+encoder_noise:
+    value: 0.1
+epochs:
+    value: 20
+grad_accum:
+    value: 4
+init_from:
+    value: checkpoints/pretrain/best.pt
+label_smoothing:
+    value: 0.05
+lr:
+    value: 0.0001
+patience:
+    value: 5
+seed:
+    value: 42
+tok:
+    value: tokenizer/tokenizer.model
+wandb_project:
+    value: lexiform
+wandb_run:
+    value: stage2-finetune
+warmup:
+    value: 500

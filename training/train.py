@@ -13,6 +13,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset, random_split
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 from model.config import ModelConfig
 from model.model import ParaphraseModel
 from training.dataset import ParaphraseDataset, collate_fn, LengthBucketSampler
@@ -56,6 +62,17 @@ def train(args):
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     print(f"Device: {device}  seed: {args.seed}")
+
+    use_wandb = _WANDB_AVAILABLE and bool(args.wandb_project)
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run or None,
+            config=vars(args),
+        )
+        print(f"W&B run: {wandb.run.url}")
+    elif args.wandb_project:
+        print("Warning: wandb not installed — run `pip install wandb` to enable tracking.")
 
     tok = Tokenizer(args.tok)
 
@@ -155,7 +172,7 @@ def train(args):
     warmup_steps    = min(args.warmup, steps_per_epoch // 2)
     print(f"Optimizer steps/epoch: {steps_per_epoch}  warmup: {warmup_steps}  total: {total_steps}")
     scheduler = make_scheduler(optimizer, warmup_steps, total_steps)
-    criterion = LabelSmoothingLoss(config.vocab_size, smoothing=0.1, ignore_index=config.pad_id)
+    criterion = LabelSmoothingLoss(config.vocab_size, smoothing=args.label_smoothing, ignore_index=config.pad_id)
     ema = EMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
     if ema is not None:
         print(f"EMA enabled (decay={args.ema_decay})")
@@ -166,8 +183,9 @@ def train(args):
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    step     = 0
-    best_val = float("inf")
+    step        = 0
+    best_val    = float("inf")
+    no_improve  = 0  # epochs without val_loss improvement (for early stopping)
 
     for epoch in range(1, args.epochs + 1):
         train_sampler.set_epoch(epoch)
@@ -200,8 +218,11 @@ def train(args):
 
             if step % 100 == 0:
                 lr = scheduler.get_last_lr()[0]
+                batch_loss = loss.item() * args.grad_accum
                 # Single sync every 100 steps is tolerable for logging.
-                print(f"epoch={epoch} step={step} loss={loss.item()*args.grad_accum:.4f} lr={lr:.2e}")
+                print(f"epoch={epoch} step={step} loss={batch_loss:.4f} lr={lr:.2e}")
+                if use_wandb:
+                    wandb.log({"train/loss": batch_loss, "train/lr": lr, "step": step})
 
         # Discard residual gradients from a partial final accumulation window
         # so they don't bleed into the next epoch's first optimizer step.
@@ -225,6 +246,8 @@ def train(args):
         val_loss = (val_loss_t / max(len(val_loader), 1)).item()
 
         print(f"=== epoch={epoch} train_loss={avg_loss:.4f} val_loss={val_loss:.4f} ===")
+        if use_wandb:
+            wandb.log({"epoch/train_loss": avg_loss, "epoch/val_loss": val_loss, "epoch": epoch})
 
         # Save: model_state is EMA weights (deployable); raw_model_state is
         # the live training weights, kept so training can be resumed exactly.
@@ -247,13 +270,28 @@ def train(args):
         torch.save(ckpt, ckpt_dir / f"checkpoint_epoch{epoch}.pt")
 
         if val_loss < best_val:
-            best_val = val_loss
+            best_val   = val_loss
+            no_improve = 0
             torch.save(ckpt, ckpt_dir / "best.pt")
             print(f"  Best model saved (val_loss={best_val:.4f})")
+            if use_wandb:
+                wandb.summary["best_val_loss"] = best_val
+                wandb.summary["best_epoch"]    = epoch
+        else:
+            no_improve += 1
+            print(f"  No improvement for {no_improve} epoch(s)"
+                  + (f" (patience={args.patience})" if args.patience > 0 else ""))
 
         # Restore live weights for the next training epoch.
         if ema is not None:
             ema.restore(model)
+
+        if args.patience > 0 and no_improve >= args.patience:
+            print(f"Early stopping: val_loss has not improved for {args.patience} epochs.")
+            break
+
+    if use_wandb:
+        wandb.finish()
 
 
 def main():
@@ -261,7 +299,7 @@ def main():
     parser.add_argument("--data",       default="data/clean.jsonl", type=Path)
     parser.add_argument("--tok",        default="tokenizer/tokenizer.model")
     parser.add_argument("--ckpt_dir",   default="checkpoints")
-    parser.add_argument("--epochs",     default=10,   type=int)
+    parser.add_argument("--epochs",     default=20,   type=int)
     parser.add_argument("--batch_size", default=64,   type=int)
     parser.add_argument("--grad_accum", default=4,    type=int)
     parser.add_argument("--warmup",     default=200,  type=int)
@@ -273,11 +311,21 @@ def main():
                         help="Per-token probability of replacing a non-pad source "
                              "token with <unk> at training time (encoder-side "
                              "regularisation). 0 disables.")
+    parser.add_argument("--label_smoothing", default=0.1, type=float,
+                        help="Label smoothing epsilon. Lower (e.g. 0.05) can help "
+                             "when fine-tuning from a strong pretrained checkpoint.")
+    parser.add_argument("--patience",   default=5,    type=int,
+                        help="Early-stopping patience: stop after this many epochs "
+                             "with no val_loss improvement. 0 disables.")
     parser.add_argument("--init_from", default="", type=str,
                         help="Path to a pretrained checkpoint (e.g. "
                              "checkpoints/pretrain/best.pt). Loads matching "
                              "parameter tensors; optimizer / EMA / scheduler "
                              "state is NOT carried over.")
+    parser.add_argument("--wandb_project", default="", type=str,
+                        help="Weights & Biases project name. Omit to disable W&B logging.")
+    parser.add_argument("--wandb_run",     default="", type=str,
+                        help="W&B run name (optional). Defaults to auto-generated name.")
     args = parser.parse_args()
     train(args)
 

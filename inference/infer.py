@@ -28,9 +28,48 @@ _reranker = None
 #
 # All four are decode-time only — no retraining, no extra deps.
 
-_PUNCT_RE = re.compile(r"[^\w\s]")
-_WS_RE    = re.compile(r"\s+")
-_WORD_RE  = re.compile(r"[A-Za-z']+")
+_PUNCT_RE  = re.compile(r"[^\w\s]")
+_WS_RE     = re.compile(r"\s+")
+_WORD_RE   = re.compile(r"[A-Za-z']+")
+_NUMBER_RE = re.compile(r"\d")
+
+# Common English words that are safe to paraphrase — everything else is "important"
+_COMMON = {
+    "the","a","an","is","are","was","were","be","been","being","have","has",
+    "had","do","does","did","will","would","could","should","may","might",
+    "shall","can","to","of","in","for","on","with","at","by","from","up",
+    "about","into","through","during","before","after","above","below",
+    "between","out","off","over","under","again","then","once","here",
+    "there","when","where","why","how","all","both","each","few","more",
+    "most","other","some","such","no","nor","not","only","own","same","so",
+    "than","too","very","just","but","and","or","as","if","i","you","he",
+    "she","it","we","they","what","which","who","this","that","these","those",
+    "am","its","our","your","his","her","their","my","me","him","us","them",
+    "get","got","go","went","come","came","see","know","think","make","say",
+    "take","give","use","find","tell","ask","seem","feel","try","leave",
+    "call","keep","let","put","mean","become","show","want","need","like",
+}
+
+
+def _important_token_ids(src_text: str, tok: "Tokenizer", vocab_size: int) -> set[int]:
+    """Return BPE token ids for words that MUST be preserved: proper nouns,
+    numbers, and rare/domain-specific words not in the common-word list.
+    These get a large positive bias in beam search so the model cannot
+    silently drop or substitute them.
+    """
+    important: set[int] = set()
+    for word in src_text.split():
+        clean = _PUNCT_RE.sub("", word).strip()
+        if not clean:
+            continue
+        is_proper  = clean[0].isupper() and clean.lower() not in _COMMON
+        is_number  = bool(_NUMBER_RE.search(clean))
+        is_rare    = clean.lower() not in _COMMON and len(clean) > 5
+        if is_proper or is_number or is_rare:
+            for tid in tok.encode(clean):
+                if tid < vocab_size:
+                    important.add(tid)
+    return important
 
 IDIOMS = {
     "no means no", "boys will be boys", "it is what it is",
@@ -132,6 +171,66 @@ def _apply_phrase_bias(
                 val = torch.tensor(list(hit.values()), device=device, dtype=scores.dtype)
                 scores[b].index_add_(0, idx, val * beta)
                 break  # use longest match only
+
+
+def _patch_entities(src_text: str, out_text: str) -> str:
+    """Restore proper nouns and numbers that the model hallucinated away.
+
+    For each important source token (proper noun, number) that is absent
+    from the output, find the proportionally-closest output word that is
+    NOT a common word and replace it with the source token. If no suitable
+    slot exists, insert the token at the proportional position.
+
+    This runs after beam search + reranking so it never distorts fluency
+    during decoding — it only patches the final string.
+    """
+    src_words = src_text.split()
+    out_words = out_text.split()
+    if not out_words:
+        return out_text
+
+    # Collect source tokens that must appear in the output but don't.
+    missing: list[tuple[int, int, str]] = []   # (src_idx, src_len, original_word)
+    for i, word in enumerate(src_words):
+        clean = _PUNCT_RE.sub("", word).strip()
+        if not clean:
+            continue
+        is_proper = clean[0].isupper() and clean.lower() not in _COMMON
+        is_number = bool(_NUMBER_RE.search(clean))
+        if (is_proper or is_number) and clean not in out_text:
+            missing.append((i, len(src_words), word))
+
+    if not missing:
+        return out_text
+
+    patched   = list(out_words)
+    replaced: set[int] = set()
+
+    for src_idx, src_len, orig_word in missing:
+        # Map source position → proportional output position.
+        ratio      = src_idx / max(src_len - 1, 1)
+        target_pos = round(ratio * (len(patched) - 1))
+        target_pos = max(0, min(target_pos, len(patched) - 1))
+
+        # Search outward from target_pos for a replaceable slot:
+        # a non-common, non-already-replaced content word.
+        placed = False
+        for offset in [0, 1, -1, 2, -2, 3, -3, 4, -4]:
+            pos = target_pos + offset
+            if 0 <= pos < len(patched) and pos not in replaced:
+                candidate = _PUNCT_RE.sub("", patched[pos]).strip()
+                if candidate and candidate.lower() not in _COMMON:
+                    patched[pos] = orig_word
+                    replaced.add(pos)
+                    placed = True
+                    break
+
+        if not placed:
+            # No replaceable slot — insert so the entity is at least present.
+            insert_at = max(0, min(target_pos, len(patched)))
+            patched.insert(insert_at, orig_word)
+
+    return " ".join(patched)
 
 
 def get_reranker() -> SentenceTransformer:
@@ -290,7 +389,9 @@ def beam_search(
     diversity_lambda: float = 0.5,
     phrase_table: dict | None = None,
     phrase_beta: float = 0.2,
-    block_source_ngrams: bool = True,
+    block_source_ngrams: bool = False,
+    entity_bias: float = 0.0,
+    src_text: str = "",
 ) -> list[str]:
     assert src_ids.size(0) == 1, "beam_search expects a single source at a time"
     if num_groups > 1:
@@ -335,7 +436,7 @@ def beam_search(
         topk_lp  = torch.cat(lp_parts)
         topk_ids = torch.cat(id_parts)
     else:
-        topk_lp, topk_ids = scores0.topk(num_beams)                 # (num_beams,)
+        topk_lp, topk_ids = scores0.topk(num_beams)                 # (num_beams,) — scores0 is (effective_vocab_size,)
 
     beam_scores  = topk_lp.clone()                                  # (num_beams,)
     beam_tokens: list[list[int]] = [[tok.bos_id, int(t)] for t in topk_ids.tolist()]
@@ -361,7 +462,16 @@ def beam_search(
     src_ids_b     = src_ids.expand(num_beams, -1).contiguous()
 
     cur = topk_ids.view(num_beams, 1)
-    V   = config.vocab_size
+    V   = config.effective_vocab_size
+
+    # Pre-compute entity token ids once — these get a positive logit bias every
+    # step so the model cannot silently drop or substitute proper nouns, numbers,
+    # and rare domain-specific words from the source.
+    entity_ids: torch.Tensor | None = None
+    if entity_bias > 0 and src_text:
+        eid_set = _important_token_ids(src_text, tok, V)
+        if eid_set:
+            entity_ids = torch.tensor(sorted(eid_set), device=device, dtype=torch.long)
 
     completed: list[tuple[float, list[int]]] = []
 
@@ -371,6 +481,11 @@ def beam_search(
         scores = scores[:, -1, :]                                   # (num_beams, V)
         if not config.use_copy:
             scores = F.log_softmax(scores, dim=-1)
+
+        # Entity protection bias: boost important source tokens so the model
+        # strongly prefers preserving proper nouns, numbers, and rare words.
+        if entity_ids is not None:
+            scores[:, entity_ids] += entity_bias
 
         # Phrase-table bias: nudge toward trained substitutions at the
         # attended source position, before n-gram blocking and top-k.
@@ -392,7 +507,7 @@ def beam_search(
         # cum-score they produce here is -inf and they cannot win top-k.
         cum = beam_scores.unsqueeze(1) + scores                     # (num_beams, V)
         if num_groups > 1:
-            top_lp, top_idx = _grouped_topk(cum, num_beams, num_groups, diversity_lambda, V)
+            top_lp, top_idx = _grouped_topk(cum, num_beams, num_groups, diversity_lambda, V)  # V = effective_vocab_size
         else:
             flat = cum.view(-1)
             top_lp, top_idx = flat.topk(num_beams)
@@ -458,38 +573,114 @@ def beam_search(
     return results
 
 
+# ---------- fluency guard ----------
+
+_OK_DOUBLES = {"had", "that", "very", "no", "ha", "so", "blah", "ll"}
+
+
+def _is_fluent(text: str) -> bool:
+    """Reject the signatures of beam-search word-salad:
+      • immediate stutter — "roller roller", "general general"
+      • repeated bigram   — "in general ... in general"
+      • repeated trigram  — stronger loop signal
+    A small allowlist permits genuine doublings ("had had", "that that").
+    """
+    words = text.lower().split()
+    if len(words) < 2:
+        return True
+
+    for a, b in zip(words, words[1:]):
+        if a == b and a not in _OK_DOUBLES:
+            return False
+
+    bigrams = list(zip(words, words[1:]))
+    if len(bigrams) != len(set(bigrams)):
+        return False
+
+    if len(words) >= 6:
+        trigrams = list(zip(words, words[1:], words[2:]))
+        if len(trigrams) != len(set(trigrams)):
+            return False
+
+    return True
+
+
+def _should_block_source(text: str) -> bool:
+    """Length-routing for source-n-gram blocking.
+
+    Short, simple inputs → blocking ON: the model can genuinely rephrase
+    these, and blocking pushes it off a near-copy into a real paraphrase.
+
+    Long or clause-heavy inputs → blocking OFF: blocking forces rephrasing at
+    every 3-gram window, which on sentences the model *can't* truly rephrase
+    produces word-salad. Better to emit a clean near-copy than break the facts.
+    """
+    words  = text.split()
+    commas = text.count(",")
+    return len(words) <= 12 and commas <= 1
+
+
 # ---------- reranking ----------
 
 def rerank(source: str, candidates: list[str], num_return: int) -> list[str]:
     """
     Score each candidate by:
-      - semantic similarity to source (want HIGH — meaning preserved)
-      - word overlap with source       (want LOW — actually rephrased)
-      - length ratio to source         (want CLOSE to 1 — penalise truncation /
-                                        over-expansion that drops or invents content)
+      - semantic similarity to source   (want HIGH — meaning preserved)
+      - word overlap with source        (want LOW — actually rephrased)
+      - length ratio to source          (want CLOSE to 1)
+      - entity preservation             (penalise missing proper nouns / numbers)
+
     Combined score = similarity
-                     - 0.3 * max(0, overlap   - 0.85)
-                     - 0.1 * |1 - len_ratio|
+                     - 0.3  * max(0, overlap - 0.85)
+                     - 0.1  * |1 - len_ratio|
+                     - 0.8  * entity_miss_rate
     """
     if not candidates:
         return []
 
-    reranker = get_reranker()
-    src_emb  = reranker.encode([source],      convert_to_tensor=True)  # (1, d)
-    cand_emb = reranker.encode(candidates,    convert_to_tensor=True)  # (N, d)
+    # Fluency guard: drop word-salad candidates. Keep the original list only
+    # if *every* candidate fails, so we never return empty here.
+    fluent = [c for c in candidates if _is_fluent(c)]
+    if fluent:
+        candidates = fluent
 
-    sim = util.cos_sim(src_emb, cand_emb)[0]  # (N,)
+    reranker = get_reranker()
+    src_emb  = reranker.encode([source],   convert_to_tensor=True)
+    cand_emb = reranker.encode(candidates, convert_to_tensor=True)
+    sim = util.cos_sim(src_emb, cand_emb)[0]
 
     src_tokens = set(source.lower().split())
     src_len    = max(1, len(source.split()))
+
+    # Collect important source tokens — proper nouns and numbers that must
+    # appear in a faithful paraphrase.
+    important_src: list[str] = []
+    for word in source.split():
+        clean = _PUNCT_RE.sub("", word).strip()
+        if not clean:
+            continue
+        if (clean[0].isupper() and clean.lower() not in _COMMON) or _NUMBER_RE.search(clean):
+            important_src.append(clean)
+
     scored: list[tuple[float, str]] = []
     for i, cand in enumerate(candidates):
         cand_tokens = cand.lower().split()
         if len(cand_tokens) < 4:
             continue
-        overlap     = sum(1 for t in cand_tokens if t in src_tokens) / len(cand_tokens)
-        length_pen  = abs(1.0 - len(cand_tokens) / src_len)
-        score = float(sim[i]) - 0.3 * max(0.0, overlap - 0.85) - 0.1 * length_pen
+        overlap    = sum(1 for t in cand_tokens if t in src_tokens) / len(cand_tokens)
+        length_pen = abs(1.0 - len(cand_tokens) / src_len)
+
+        # Entity miss rate: fraction of important source tokens absent from output.
+        if important_src:
+            missed     = sum(1 for e in important_src if e not in cand)
+            entity_pen = missed / len(important_src)
+        else:
+            entity_pen = 0.0
+
+        score = (float(sim[i])
+                 - 0.3 * max(0.0, overlap - 0.85)
+                 - 0.1 * length_pen
+                 - 0.8 * entity_pen)
         scored.append((score, cand))
 
     scored.sort(reverse=True)
@@ -508,7 +699,7 @@ def paraphrase(
     diversity_lambda: float = 0.5,
     phrase_table: dict | None = None,
     phrase_beta: float = 0.2,
-    block_source_ngrams: bool = True,
+    block_source_ngrams: bool | None = None,
     min_edit_ratio: float = 0.15,
     echo_short_inputs: bool = True,
 ) -> list[str]:
@@ -516,6 +707,10 @@ def paraphrase(
     # vocatives. Bypasses the entire pipeline.
     if echo_short_inputs and is_unparaphrasable(text):
         return [text]
+
+    # Length-routing: None (default) → auto-decide blocking from input
+    # complexity; an explicit bool forces it.
+    block = _should_block_source(text) if block_source_ngrams is None else block_source_ngrams
 
     src     = "<paraphrase> " + text
     src_ids = torch.tensor(
@@ -527,7 +722,8 @@ def paraphrase(
         num_beams=num_beams, num_return=10,
         num_groups=num_groups, diversity_lambda=diversity_lambda,
         phrase_table=phrase_table, phrase_beta=phrase_beta,
-        block_source_ngrams=block_source_ngrams,
+        block_source_ngrams=block,
+        src_text=text,
     )
     # Over-rank then post-filter so Tier 0.1 / 0.5 have multiple options to
     # choose from instead of seeing only the reranker's top-N.
@@ -540,6 +736,21 @@ def paraphrase(
     # Tier 0.5 — drop candidates with insufficient token-level edits.
     if min_edit_ratio > 0:
         ranked = [c for c in ranked if edit_ratio(text, c) >= min_edit_ratio]
+
+    # Tier 0.6 — faithfulness fallback: if the best candidate is missing too
+    # many important source tokens (>50%), the model hallucinated — echo the
+    # source rather than emit factually wrong output.
+    if ranked:
+        important = [_PUNCT_RE.sub("", w).strip() for w in text.split()
+                     if _PUNCT_RE.sub("", w).strip()
+                     and (_PUNCT_RE.sub("", w)[0].isupper()
+                          and _PUNCT_RE.sub("", w).lower() not in _COMMON
+                          or _NUMBER_RE.search(w))]
+        if important:
+            best = ranked[0]
+            miss_rate = sum(1 for e in important if e not in best) / len(important)
+            if miss_rate > 0.5:
+                return [text]
 
     # Fallback: if nothing survived the Tier-0 filters, echo the source rather
     # than emit a broken near-copy. This is the safety net for paraphrasable
@@ -568,8 +779,11 @@ def main():
     parser.add_argument("--phrase_beta", default=0.2, type=float,
                         help="Strength of the phrase-table additive log-prob bias (0 = off).")
     # Tier 0 — guaranteed-paraphrasing knobs.
-    parser.add_argument("--no_block_source", action="store_true",
-                        help="Disable Tier 0.2 source-n-gram blocking at decode.")
+    parser.add_argument("--block_source", action="store_true",
+                        help="Force Tier 0.2 source-n-gram blocking ON for all inputs. "
+                             "Default is length-routing: blocking ON for short/simple "
+                             "inputs (model rephrases well), OFF for long/clause-heavy "
+                             "inputs (where blocking produces word-salad).")
     parser.add_argument("--min_edit_ratio", default=0.15, type=float,
                         help="Tier 0.5 — drop candidates with token-edit ratio < this. "
                              "0 disables.")
@@ -594,7 +808,7 @@ def main():
                                  num_groups=args.groups,
                                  diversity_lambda=args.diversity_lambda,
                                  phrase_table=ptable, phrase_beta=args.phrase_beta,
-                                 block_source_ngrams=not args.no_block_source,
+                                 block_source_ngrams=(True if args.block_source else None),
                                  min_edit_ratio=args.min_edit_ratio,
                                  echo_short_inputs=not args.no_echo_gate)
             for i, o in enumerate(outputs, 1):

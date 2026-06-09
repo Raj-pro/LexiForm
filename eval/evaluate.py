@@ -16,11 +16,14 @@ from model.config import ModelConfig
 from model.model import ParaphraseModel
 from tokenizer.tokenizer import Tokenizer
 from training.dataset import ParaphraseDataset
-from inference.infer import beam_search, rerank, get_reranker
+from inference.infer import beam_search, rerank, get_reranker, _should_block_source
 
 
 def run_eval(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "mps" if torch.backends.mps.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     tok    = Tokenizer(args.tok)
 
     ckpt   = torch.load(args.ckpt, map_location=device, weights_only=True)
@@ -28,6 +31,11 @@ def run_eval(args):
     model  = ParaphraseModel(config).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
+
+    if args.no_copy:
+        model.config.use_copy = False
+        config = model.config
+        print("Copy mechanism disabled — using pure vocab distribution.")
 
     dataset  = ParaphraseDataset(args.data, tok, max_len=config.max_seq_len)
     val_size = max(2000, int(0.05 * len(dataset)))
@@ -55,7 +63,9 @@ def run_eval(args):
             dtype=torch.long, device=device,
         )
         candidates = beam_search(model, src_ids, tok, config,
-                                 num_beams=args.beams, num_return=10)
+                                 num_beams=args.beams, num_return=10,
+                                 block_source_ngrams=_should_block_source(src_text),
+                                 src_text=src_text)
         ranked = rerank(src_text, candidates, num_return=1)
         pred   = ranked[0] if ranked else (candidates[0] if candidates else "")
 
@@ -103,6 +113,8 @@ def main():
     parser.add_argument("--samples", default=5,  type=int)
     parser.add_argument("--limit",   default=0,  type=int, help="0 = full val set")
     parser.add_argument("--seed",    default=42, type=int)
+    parser.add_argument("--no_copy", action="store_true",
+                        help="Disable the pointer-generator copy mechanism at inference.")
     args = parser.parse_args()
     run_eval(args)
 

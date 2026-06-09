@@ -43,7 +43,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed breakdown of every module.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install torch sentencepiece transformers datasets sentence-transformers sacrebleu rouge-score bert-score langdetect
+pip install torch sentencepiece transformers datasets sentence-transformers sacrebleu rouge-score bert-score langdetect wandb
 ```
 
 ## Quickstart
@@ -103,9 +103,17 @@ python3 -m training.pretrain \
 
 ```bash
 python3 -m training.train \
-    --data       data/clean.jsonl \
-    --tok        tokenizer/tokenizer.model \
-    --init_from  checkpoints/pretrain/best.pt
+    --data            data/clean_combined.jsonl \
+    --tok             tokenizer/tokenizer.model \
+    --init_from       checkpoints/pretrain/best.pt \
+    --ckpt_dir        checkpoints/finetune/ \
+    --epochs          20 \
+    --lr              1e-4 \
+    --warmup          500 \
+    --label_smoothing 0.05 \
+    --patience        5 \
+    --wandb_project   lexiform \
+    --wandb_run       stage2-finetune
 ```
 
 ### Data preparation (if starting from scratch)
